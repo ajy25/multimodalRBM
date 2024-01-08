@@ -1,8 +1,10 @@
+import os
+import json
 import torch
 import torch.nn as nn
 from .util import build_dataloader
 
-class RBM(nn.Module):
+class RBMBackend(nn.Module):
     """
     Restricted Boltzmann Machine. 
 
@@ -127,7 +129,7 @@ class RBM(nn.Module):
                   X_binary: torch.Tensor = None, 
                   X_continuous_clamp: torch.Tensor = None, 
                   X_binary_clamp: torch.Tensor = None,
-                  n_gibbs: int = 10):
+                  n_gibbs: int = 10, binary_proba: bool = False):
         """
         Returns fantasy particles sampled from initial X_continuous and 
         X_binary. If clamps exist (Boolean masks), then elements corresponding 
@@ -145,6 +147,7 @@ class RBM(nn.Module):
         - X_continuous_clamp: torch.Tensor ~ (n_examples, n_vis_continuous)
         - X_binary_clamp: torch.Tensor ~ (n_examples, n_vis_binary)
         - n_gibbs: int
+        - binary_proba: bool << if True, returns probabilities
 
         @returns
         - X_continuous
@@ -152,15 +155,18 @@ class RBM(nn.Module):
         """
         X_continuous, X_binary = self.impute_missing(X_continuous, X_binary, 
             n_gibbs)
-        _, X_continuous, X_binary = self._block_gibbs_sample(
+        latent, X_continuous, X_binary = self._block_gibbs_sample(
             v_continuous=X_continuous,
             v_binary=X_binary,
             v_continuous_clamp=X_continuous_clamp,
             v_binary_clamp=X_binary_clamp,
             n_gibbs=n_gibbs
         )
+        if binary_proba and self.n_vis_binary > 0:
+            X_binary = latent @ self.W_binary.t() + self.a
         return X_continuous, X_binary
     
+    @torch.no_grad()
     def impute_missing(self, X_continuous: torch.Tensor = None, 
                        X_binary: torch.Tensor = None, n_gibbs=10):
         """
@@ -197,16 +203,31 @@ class RBM(nn.Module):
             n_gibbs=n_gibbs)
         return X_continuous, X_binary
     
-    def save_state(self, path: str):
+    def save_state(self, path: str, meta_path: str = None):
         """
         Saves the model state to a .pth file containing model weights and a 
         .json file containing model hyperparameter specifications. 
 
         @args
-        - path: str << filepath, must be of the form XXXX.pth; an XXXX.json file 
-            will also be created.
+        - path: str << filepath, must be of the form XXXX.pth
+        - meta_path: str << filepath, must be of the form YYYY.json; if None,
+            an XXXX.json file will be created
         """
-        pass
+        if meta_path is None:
+            meta_path = os.path.splitext(path)[0] + ".json"
+        torch.save(self.state_dict(), path)
+        with open(meta_path, "w") as json_file:
+            json.dump(self.metadata(), json_file)
+
+    def metadata(self):
+        """
+        Returns model metadata.
+        """
+        return {
+            "n_vis_continuous": self.n_vis_continuous,
+            "n_vis_binary": self.n_vis_binary,
+            "n_hid": self.n_hid
+        }
 
     def _reset_parameters(self):
         """
@@ -327,7 +348,8 @@ class RBM(nn.Module):
         - v_binary: torch.Tensor ~ (batch_size, n_vis_binary)
         - v_continuous_clamp: torch.Tensor ~ (batch_size, n_vis_continuous)
         - v_binary_clamp: torch.Tensor ~ (batch_size, n_vis_binary)
-        - n_gibbs: int << if 0, only the hidden units are changed
+        - n_gibbs: int << same as burn in; if 0, only the hidden units 
+            are changed
 
         @returns
         - h: torch.Tensor ~ (batch_size, n_hid)
@@ -406,5 +428,21 @@ class RBM(nn.Module):
                 p=torch.sigmoid(h @ self.W_binary.t() + self.a),
                 generator=self.rng)
         return v_continuous_sample, v_binary_sample
-    
 
+def build_from_checkpoint(path: str, meta_path: str = None) -> RBMBackend:
+    """     
+    Returns an RBM object 
+
+    @args
+    - path: str << filepath, must be of the form XXXX.pth
+    - meta_path: str << filepath, must be of the form YYYY.json; if None,
+        an XXXX.json file will be created
+    """
+    if meta_path is None:
+        meta_path = ".".join(path.split(".")[:-1]) + ".json"
+    with open(meta_path, "r") as json_file:
+        metadata = json.load(json_file)
+    model = RBMBackend(metadata["n_vis_continuous"], metadata["n_vis_binary"], 
+        metadata["n_hid"])
+    model.load_state_dict(torch.load(path))
+    return model
